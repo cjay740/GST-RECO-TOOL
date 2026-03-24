@@ -693,11 +693,33 @@ def reconcile_gstin_level(books_df, portal_df, tol):
     def classify(row):
         if row["_merge"] == "left_only":  return "Only in Books"
         if row["_merge"] == "right_only": return "Only in Portal"
-        if abs(row["Diff_TotalTax"]) <= tol and abs(row["Diff_Taxable"]) <= tol:
+        # Taxable value difference is IGNORED — only total tax decides match/mismatch
+        if abs(row["Diff_TotalTax"]) <= tol:
             return "Matched"
         return "Mismatched"
 
-    merged["Status"] = merged.apply(classify, axis=1)
+    def get_remarks(row):
+        if row["Status"] not in ("Matched", "Mismatched"):
+            return ""
+        remarks = []
+        # Taxable difference note (informational — doesn't cause mismatch)
+        if abs(row.get("Diff_Taxable", 0)) > tol:
+            remarks.append(f"ℹ️ Taxable differs by ₹{abs(row['Diff_Taxable']):.2f} — tax matches")
+        # IGST ↔ CGST+SGST swap detection
+        igst_b = float(row.get("IGST_Books",  0) or 0)
+        cgst_b = float(row.get("CGST_Books",  0) or 0)
+        sgst_b = float(row.get("SGST_Books",  0) or 0)
+        igst_p = float(row.get("IGST_Portal", 0) or 0)
+        cgst_p = float(row.get("CGST_Portal", 0) or 0)
+        sgst_p = float(row.get("SGST_Portal", 0) or 0)
+        if abs(igst_b - (cgst_p + sgst_p)) <= tol and igst_b > tol:
+            remarks.append("⚠️ Tax head swap: IGST in Books = CGST+SGST in Portal — verify inter/intra-state")
+        elif abs((cgst_b + sgst_b) - igst_p) <= tol and igst_p > tol:
+            remarks.append("⚠️ Tax head swap: CGST+SGST in Books = IGST in Portal — verify inter/intra-state")
+        return " | ".join(remarks)
+
+    merged["Status"]  = merged.apply(classify, axis=1)
+    merged["Remarks"] = merged.apply(get_remarks, axis=1)
     merged.drop(columns=["_merge"], inplace=True)
     num_cols = merged.select_dtypes(include=[np.number]).columns
     merged[num_cols] = merged[num_cols].round(2)
@@ -753,11 +775,31 @@ def reconcile_invoice_level(books_df, portal_df, tol):
     def classify(row):
         if row["_merge"] == "left_only":  return "Only in Books"
         if row["_merge"] == "right_only": return "Only in Portal"
-        if abs(row["Diff_TotalTax"]) <= tol and abs(row["Diff_Taxable"]) <= tol:
+        # Taxable value difference is IGNORED — only total tax decides match/mismatch
+        if abs(row["Diff_TotalTax"]) <= tol:
             return "Matched"
         return "Mismatched"
 
-    merged["Status"] = merged.apply(classify, axis=1)
+    def get_remarks(row):
+        if row["Status"] not in ("Matched", "Mismatched"):
+            return ""
+        remarks = []
+        if abs(row.get("Diff_Taxable", 0)) > tol:
+            remarks.append(f"ℹ️ Taxable differs by ₹{abs(row['Diff_Taxable']):.2f} — tax matches")
+        igst_b = float(row.get("IGST_Books",  0) or 0)
+        cgst_b = float(row.get("CGST_Books",  0) or 0)
+        sgst_b = float(row.get("SGST_Books",  0) or 0)
+        igst_p = float(row.get("IGST_Portal", 0) or 0)
+        cgst_p = float(row.get("CGST_Portal", 0) or 0)
+        sgst_p = float(row.get("SGST_Portal", 0) or 0)
+        if abs(igst_b - (cgst_p + sgst_p)) <= tol and igst_b > tol:
+            remarks.append("⚠️ Tax head swap: IGST in Books = CGST+SGST in Portal — verify inter/intra-state")
+        elif abs((cgst_b + sgst_b) - igst_p) <= tol and igst_p > tol:
+            remarks.append("⚠️ Tax head swap: CGST+SGST in Books = IGST in Portal — verify inter/intra-state")
+        return " | ".join(remarks)
+
+    merged["Status"]  = merged.apply(classify, axis=1)
+    merged["Remarks"] = merged.apply(get_remarks, axis=1)
     merged.drop(columns=["_merge","_key"], inplace=True)
     num_cols = merged.select_dtypes(include=[np.number]).columns
     merged[num_cols] = merged[num_cols].round(2)
