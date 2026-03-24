@@ -1,10 +1,11 @@
 """
-GST ITC Reconciliation Tool — Advanced Version
-================================================
-New in v2:
-  • Fuzzy invoice matching — catches near-matches like 'INV-123' vs 'INV123'
-  • Colour-coded Excel download — green/red/yellow/purple traffic-light rows
-  • Supplier drill-down — pick any GSTIN and see all its invoices side by side
+GST ITC Reconciliation Tool — v3
+==================================
+New in v3:
+  • Smart Python matching (Step 3) — deep invoice cleaning, amount-only matching,
+    numeric token matching to catch cases fuzzy logic misses
+  • Claude AI matching (Step 4) — remaining hard cases sent to Claude API
+    for reasoning-based match suggestions with confidence scores
 
 Run:  streamlit run app.py
 """
@@ -12,11 +13,19 @@ Run:  streamlit run app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
+import re
+import json
 from io import BytesIO
 from datetime import datetime
 from difflib import SequenceMatcher
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
 
 # ─────────────────────────────────────────────
 # Page config
@@ -78,6 +87,24 @@ with st.sidebar:
     fuzzy_threshold = st.slider("Fuzzy match sensitivity", min_value=50, max_value=100, value=80,
                                 help="How similar two invoice numbers must be to be fuzzy-matched. 100 = exact only, 80 = allows minor differences.")
 
+    st.divider()
+    st.subheader("🤖 AI Matching (Step 4)")
+    st.caption("Claude AI reviews remaining unmatched items and suggests matches with reasoning.")
+    ai_api_key = st.text_input(
+        "Anthropic API Key",
+        type="password",
+        placeholder="sk-ant-...",
+        help="Get your key from console.anthropic.com. Key is never stored — only used for this session."
+    )
+    ai_model = st.selectbox(
+        "AI Model",
+        ["claude-haiku-4-5-20251001", "claude-sonnet-4-6"],
+        index=0,
+        help="Haiku is faster and cheaper (~₹0.5/run). Sonnet is more accurate (~₹3/run)."
+    )
+    ai_batch_size = st.slider("Max items per GSTIN sent to AI", 5, 30, 15,
+        help="Per-GSTIN limit. Lower = cheaper but may miss some matches.")
+
 # ─────────────────────────────────────────────
 # Helper functions
 # ─────────────────────────────────────────────
@@ -97,6 +124,319 @@ def safe_float(col):
 def similarity(a, b):
     """Return 0-100 similarity score between two strings."""
     return round(SequenceMatcher(None, str(a), str(b)).ratio() * 100, 1)
+
+# ─────────────────────────────────────────────
+# Step 3: Smart Python matching helpers
+# ─────────────────────────────────────────────
+# Common invoice prefixes to strip
+_INV_PREFIXES = re.compile(
+    r'^(INV|BILL|PO|GRN|TXN|GST|TAX|VCH|VOUCHER|INVOICE|RCT|RCPT|RECEIPT|'
+    r'SB|DM|CM|CR|DR|NF|DN|CN|MFG|MF|SL|SLV|SI|PI|LR|AWB|DC|GDN|IN|OUT)[-/\s]*',
+    re.IGNORECASE
+)
+# Financial year codes: 2025-26 / 25-26 / 2526 / FY26 / FY2526
+_YEAR_CODE = re.compile(r'(20\d{2}[-/]\d{2}|\b\d{2}[-/]\d{2}\b|FY\s*\d{2,4}|\b2[0-9]{3}\b)', re.IGNORECASE)
+# Non-alphanumeric characters
+_NON_ALNUM = re.compile(r'[^A-Z0-9]')
+
+def deep_clean_invoice(s):
+    """Aggressively normalise invoice number for Step 3 matching."""
+    if pd.isna(s) or str(s).strip() == "": return ""
+    s = str(s).strip().upper()
+    s = _YEAR_CODE.sub("", s)          # strip year codes
+    s = _INV_PREFIXES.sub("", s)       # strip common prefixes
+    s = _NON_ALNUM.sub("", s)          # keep only letters & digits
+    s = s.lstrip("0")                  # strip leading zeros
+    return s.strip()
+
+def get_numeric_tokens(s):
+    """Extract all numeric sequences from an invoice string.
+    E.g. 'NF/2025/00123' → ['2025', '123']"""
+    return [t.lstrip("0") for t in re.findall(r'\d+', str(s)) if t.lstrip("0")]
+
+def apply_smart_matching(only_books_df, only_portal_df, tol):
+    """
+    Step 3 — three Python sub-passes on items still unmatched after fuzzy:
+
+    Pass A : Deep-clean both invoice numbers → exact match
+             (strips year codes, prefixes, special chars)
+
+    Pass B : Same GSTIN + exact total tax amount match
+             (when invoice format is too different to compare, but ₹ amount is unique)
+
+    Pass C : Numeric-token match — extract digit sequences from invoice
+             and match on the longest common token
+             (e.g. 'NF/25-26/000123' ↔ 'NF-123' both have core token '123')
+    """
+    if only_books_df.empty or only_portal_df.empty:
+        return only_books_df, only_portal_df, pd.DataFrame()
+
+    smart_rows     = []
+    b_used_idx     = set()
+    p_used_idx     = set()
+
+    common_gstins = (
+        set(only_books_df["GSTIN"].dropna()) &
+        set(only_portal_df["GSTIN"].dropna())
+    )
+
+    for gstin in common_gstins:
+        b_sub = only_books_df[only_books_df["GSTIN"] == gstin].copy()
+        p_sub = only_portal_df[only_portal_df["GSTIN"] == gstin].copy()
+
+        b_sub["_deep"] = b_sub["Invoice_No"].apply(deep_clean_invoice)
+        p_sub["_deep"] = p_sub["Invoice_No"].apply(deep_clean_invoice)
+        b_sub["_tokens"] = b_sub["Invoice_No"].apply(get_numeric_tokens)
+        p_sub["_tokens"] = p_sub["Invoice_No"].apply(get_numeric_tokens)
+
+        def _get_tax(row, is_books):
+            return float(row.get("TotalTax_Books" if is_books else "TotalTax_Portal",
+                                  row.get("Total_Tax", 0)) or 0)
+        def _get_taxable(row, is_books):
+            return float(row.get("Taxable_Books" if is_books else "Taxable_Portal",
+                                  row.get("Taxable_Value", 0)) or 0)
+        def _sid(row):
+            return row.get("Supplier_ID", row.get("Supplier_ID_Books", ""))
+
+        def _record(b_idx, p_idx, pass_name, note):
+            b_row = only_books_df.loc[b_idx]
+            p_row = only_portal_df.loc[p_idx]
+            b_tax = _get_tax(b_row, True); p_tax = _get_tax(p_row, False)
+            amt_ok = abs(b_tax - p_tax) <= tol
+            status = f"Smart:{pass_name} ✓" if amt_ok else f"Smart:{pass_name} ⚠ Amt Diff"
+            return {
+                "Match_Type":        f"Smart — {pass_name}",
+                "Supplier_ID_Books": _sid(b_row),
+                "GSTIN":             gstin,
+                "Supplier_Books":    b_row.get("Supplier_Name", b_row.get("Supplier_Books", "")),
+                "Invoice_Books":     b_row.get("Invoice_No", ""),
+                "Invoice_Portal":    p_row.get("Invoice_No", ""),
+                "Note":              note,
+                "Taxable_Books":     round(_get_taxable(b_row, True), 2),
+                "Taxable_Portal":    round(_get_taxable(p_row, False), 2),
+                "TotalTax_Books":    round(b_tax, 2),
+                "TotalTax_Portal":   round(p_tax, 2),
+                "Tax_Difference":    round(b_tax - p_tax, 2),
+                "Status":            status,
+            }
+
+        # ── Pass A: deep-cleaned exact match ──────────────────
+        p_deep_index = {row["_deep"]: idx
+                        for idx, row in p_sub.iterrows()
+                        if row["_deep"] and idx not in p_used_idx}
+
+        for b_idx, b_row in b_sub.iterrows():
+            if b_idx in b_used_idx: continue
+            key = b_row["_deep"]
+            if key and key in p_deep_index:
+                p_idx = p_deep_index[key]
+                if p_idx not in p_used_idx:
+                    smart_rows.append(_record(b_idx, p_idx, "DeepClean",
+                        f"'{b_row['Invoice_No']}' ↔ '{only_portal_df.loc[p_idx,'Invoice_No']}' after stripping year codes & prefixes"))
+                    b_used_idx.add(b_idx); p_used_idx.add(p_idx)
+                    del p_deep_index[key]
+
+        # ── Pass B: exact amount match (same GSTIN, unique amount) ─
+        b_rem = b_sub[~b_sub.index.isin(b_used_idx)]
+        p_rem = p_sub[~p_sub.index.isin(p_used_idx)]
+
+        # Build amount → [idx] map for portal
+        p_amt_map = {}
+        for p_idx, p_row in p_rem.iterrows():
+            tax = round(_get_tax(only_portal_df.loc[p_idx], False), 2)
+            p_amt_map.setdefault(tax, []).append(p_idx)
+
+        for b_idx, b_row in b_rem.iterrows():
+            if b_idx in b_used_idx: continue
+            b_tax = round(_get_tax(only_books_df.loc[b_idx], True), 2)
+            if b_tax == 0: continue           # skip zero-tax entries
+            candidates = [i for i in p_amt_map.get(b_tax, []) if i not in p_used_idx]
+            if len(candidates) == 1:          # unique match only
+                p_idx = candidates[0]
+                smart_rows.append(_record(b_idx, p_idx, "AmountMatch",
+                    f"Unique exact tax amount ₹{b_tax} for this GSTIN — invoice formats differ"))
+                b_used_idx.add(b_idx); p_used_idx.add(p_idx)
+
+        # ── Pass C: numeric token match ───────────────────────
+        b_rem2 = b_sub[~b_sub.index.isin(b_used_idx)]
+        p_rem2 = p_sub[~p_sub.index.isin(p_used_idx)]
+
+        # Build longest-token → [idx] map for portal
+        p_token_map = {}
+        for p_idx, p_row in p_rem2.iterrows():
+            tokens = p_row["_tokens"]
+            if tokens:
+                key = max(tokens, key=len)    # use longest numeric token
+                if len(key) >= 3:             # ignore very short tokens
+                    p_token_map.setdefault(key, []).append(p_idx)
+
+        for b_idx, b_row in b_rem2.iterrows():
+            if b_idx in b_used_idx: continue
+            tokens = b_row["_tokens"]
+            if not tokens: continue
+            b_key = max(tokens, key=len)
+            if len(b_key) < 3: continue
+            candidates = [i for i in p_token_map.get(b_key, []) if i not in p_used_idx]
+            if len(candidates) == 1:
+                p_idx = candidates[0]
+                smart_rows.append(_record(b_idx, p_idx, "TokenMatch",
+                    f"Core numeric token '{b_key}' found in both invoice numbers"))
+                b_used_idx.add(b_idx); p_used_idx.add(p_idx)
+
+    smart_df = pd.DataFrame(smart_rows)
+    rem_books  = only_books_df.drop(index=list(b_used_idx)).reset_index(drop=True)
+    rem_portal = only_portal_df.drop(index=list(p_used_idx)).reset_index(drop=True)
+    return rem_books, rem_portal, smart_df
+
+# ─────────────────────────────────────────────
+# Step 4: Claude AI matching
+# ─────────────────────────────────────────────
+def apply_ai_matching(only_books_df, only_portal_df, api_key, model, batch_size, tol):
+    """
+    Send remaining unmatched items to Claude API grouped by GSTIN.
+    Claude reasons about invoice format differences and suggests matches.
+    Returns a dataframe of AI-suggested matches.
+    """
+    if not ANTHROPIC_AVAILABLE:
+        return only_books_df, only_portal_df, pd.DataFrame(), "anthropic package not installed"
+
+    if only_books_df.empty or only_portal_df.empty:
+        return only_books_df, only_portal_df, pd.DataFrame(), "No items to match"
+
+    client = anthropic.Anthropic(api_key=api_key)
+    ai_rows    = []
+    b_used_idx = set()
+    p_used_idx = set()
+    errors     = []
+
+    common_gstins = (
+        set(only_books_df["GSTIN"].dropna()) &
+        set(only_portal_df["GSTIN"].dropna())
+    )
+
+    def _get_tax(row, is_books):
+        return float(row.get("TotalTax_Books" if is_books else "TotalTax_Portal",
+                              row.get("Total_Tax", 0)) or 0)
+    def _get_taxable(row, is_books):
+        return float(row.get("Taxable_Books" if is_books else "Taxable_Portal",
+                              row.get("Taxable_Value", 0)) or 0)
+    def _sid(row):
+        return row.get("Supplier_ID", row.get("Supplier_ID_Books", ""))
+
+    for gstin in common_gstins:
+        b_sub = only_books_df[only_books_df["GSTIN"] == gstin].head(batch_size)
+        p_sub = only_portal_df[only_portal_df["GSTIN"] == gstin].head(batch_size)
+        if b_sub.empty or p_sub.empty: continue
+
+        b_name = b_sub.iloc[0].get("Supplier_Name", b_sub.iloc[0].get("Supplier_Books", ""))
+
+        # Build compact invoice lists for the prompt
+        b_list = [{"id": str(i), "invoice": row.get("Invoice_No",""),
+                   "tax": round(_get_tax(row, True), 2),
+                   "taxable": round(_get_taxable(row, True), 2)}
+                  for i, row in b_sub.iterrows()]
+        p_list = [{"id": str(i), "invoice": row.get("Invoice_No",""),
+                   "tax": round(_get_tax(row, False), 2),
+                   "taxable": round(_get_taxable(row, False), 2)}
+                  for i, row in p_sub.iterrows()]
+
+        prompt = f"""You are an expert Indian Chartered Accountant doing GST ITC reconciliation.
+
+Supplier: {b_name}  |  GSTIN: {gstin}
+
+These invoices from BOOKS could not be matched with the PORTAL using exact or fuzzy matching:
+
+BOOKS invoices (unmatched):
+{json.dumps(b_list, indent=2)}
+
+PORTAL invoices (unmatched):
+{json.dumps(p_list, indent=2)}
+
+Your task: Identify which Books invoice likely matches which Portal invoice.
+Reasons invoices may not have matched automatically:
+- Year codes like "2025-26", "FY26", "25-26" present in one but not the other
+- Common prefixes like "INV-", "BILL/", "DCM/" differ between systems
+- Leading zeros differ (e.g. "0123" vs "123")
+- Slash/dash/dot separators differ (e.g. "NF/123" vs "NF-123")
+- Amount may differ slightly due to rounding (up to ₹{tol * 2} tolerance)
+
+Rules:
+- Only match if you are reasonably confident (Medium or High confidence)
+- Do NOT force-match if there is genuine uncertainty
+- Use the "id" field to reference each invoice (these are row index numbers)
+- Tax amounts should be close (within ₹{tol * 2})
+
+Return ONLY a valid JSON array, no other text:
+[
+  {{
+    "book_id": "<id from Books list>",
+    "portal_id": "<id from Portal list>",
+    "confidence": "High" or "Medium" or "Low",
+    "reason": "<brief explanation>"
+  }}
+]
+
+If no matches found, return an empty array: []"""
+
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            raw = response.content[0].text.strip()
+            # Extract JSON array from response
+            json_match = re.search(r'\[.*\]', raw, re.DOTALL)
+            if not json_match:
+                errors.append(f"{gstin}: Could not parse AI response")
+                continue
+            matches = json.loads(json_match.group())
+
+            for m in matches:
+                try:
+                    b_idx = int(m["book_id"])
+                    p_idx = int(m["portal_id"])
+                    if b_idx in b_used_idx or p_idx in p_used_idx: continue
+                    if b_idx not in only_books_df.index: continue
+                    if p_idx not in only_portal_df.index: continue
+
+                    b_row = only_books_df.loc[b_idx]
+                    p_row = only_portal_df.loc[p_idx]
+                    b_tax = _get_tax(b_row, True)
+                    p_tax = _get_tax(p_row, False)
+                    confidence = m.get("confidence", "Medium")
+                    amt_ok = abs(b_tax - p_tax) <= tol * 3
+
+                    ai_rows.append({
+                        "Match_Type":        f"AI — {confidence} Confidence",
+                        "Supplier_ID_Books": _sid(b_row),
+                        "GSTIN":             gstin,
+                        "Supplier_Books":    b_row.get("Supplier_Name", b_row.get("Supplier_Books", "")),
+                        "Invoice_Books":     b_row.get("Invoice_No", ""),
+                        "Invoice_Portal":    p_row.get("Invoice_No", ""),
+                        "AI_Confidence":     confidence,
+                        "AI_Reason":         m.get("reason", ""),
+                        "Taxable_Books":     round(_get_taxable(b_row, True), 2),
+                        "Taxable_Portal":    round(_get_taxable(p_row, False), 2),
+                        "TotalTax_Books":    round(b_tax, 2),
+                        "TotalTax_Portal":   round(p_tax, 2),
+                        "Tax_Difference":    round(b_tax - p_tax, 2),
+                        "Status":            f"AI Matched ✓" if amt_ok else "AI Matched ⚠ Amt Diff",
+                    })
+                    b_used_idx.add(b_idx)
+                    p_used_idx.add(p_idx)
+                except (KeyError, ValueError, TypeError):
+                    continue
+
+        except Exception as e:
+            errors.append(f"{gstin}: {str(e)[:80]}")
+            continue
+
+    ai_df     = pd.DataFrame(ai_rows)
+    rem_books  = only_books_df.drop(index=list(b_used_idx)).reset_index(drop=True)
+    rem_portal = only_portal_df.drop(index=list(p_used_idx)).reset_index(drop=True)
+    err_msg    = "; ".join(errors) if errors else None
+    return rem_books, rem_portal, ai_df, err_msg
 
 def load_books(df):
     out = pd.DataFrame()
@@ -653,6 +993,25 @@ if run_btn:
             only_books.copy(), only_portal.copy(), fuzzy_threshold, amt_tol=tolerance
         )
 
+    with st.spinner("Running smart Python matching (deep clean, amount, token)..."):
+        only_books_rem, only_portal_rem, smart_df = apply_smart_matching(
+            only_books_rem, only_portal_rem, tolerance
+        )
+
+    # Store in session state so AI can use them later without re-running
+    st.session_state["only_books_rem"]  = only_books_rem
+    st.session_state["only_portal_rem"] = only_portal_rem
+    st.session_state["matched"]         = matched
+    st.session_state["mismatched"]      = mismatched
+    st.session_state["fuzzy_df"]        = fuzzy_df
+    st.session_state["smart_df"]        = smart_df
+    st.session_state["no_gstin"]        = no_gstin
+    st.session_state["full"]            = full
+    st.session_state["books_df"]        = books_df
+    st.session_state["portal_df"]       = portal_df
+    st.session_state["recon_done"]      = True
+    st.session_state["ai_df"]           = pd.DataFrame()   # reset AI results on new run
+
     # ── Amount summary ──
     bk = books_df.dropna(subset=["GSTIN"])
     amt_rows = []
@@ -670,6 +1029,7 @@ if run_btn:
         "matched":    len(matched),
         "mismatched": len(mismatched),
         "fuzzy":      len(fuzzy_df),
+        "smart":      len(smart_df),
         "only_books": len(only_books_rem),
         "only_portal":len(only_portal_rem),
         "no_gstin":   len(no_gstin),
@@ -678,17 +1038,19 @@ if run_btn:
     # ── Summary metrics ──
     st.divider()
     st.subheader("📊 Reconciliation Summary")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("✅ Matched",        len(matched))
     c2.metric("⚠️ Mismatched",     len(mismatched))
     c3.metric("🔀 Fuzzy Matched",  len(fuzzy_df))
-    c4.metric("📘 Only in Books",  len(only_books_rem))
-    c5.metric("🌐 Only in Portal", len(only_portal_rem))
-    c6.metric("🚫 No GSTIN",       len(no_gstin))
+    c4.metric("🧠 Smart Matched",  len(smart_df))
+    c5.metric("📘 Only in Books",  len(only_books_rem))
+    c6.metric("🌐 Only in Portal", len(only_portal_rem))
+    c7.metric("🚫 No GSTIN",       len(no_gstin))
 
-    if len(fuzzy_df) > 0:
-        st.info(f"🔀 **Fuzzy matching** found {len(fuzzy_df)} additional near-matches that exact matching missed. "
-                f"Review them in the **Fuzzy Matched** tab.")
+    total_near = len(fuzzy_df) + len(smart_df)
+    if total_near > 0:
+        st.info(f"🔀 Fuzzy + Smart matching found **{total_near} additional near-matches** "
+                f"beyond exact matching. Review the Fuzzy and Smart Matched tabs.")
 
     # ── Amount summary ──
     st.subheader("💰 Amount Summary")
@@ -702,61 +1064,136 @@ if run_btn:
 
     # ── Detailed tabs ──
     st.divider()
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         f"✅ Matched ({len(matched)})",
         f"⚠️ Mismatched ({len(mismatched)})",
-        f"🔀 Fuzzy Matched ({len(fuzzy_df)})",
-        f"📘 Only in Books ({len(only_books_rem)})",
-        f"🌐 Only in Portal ({len(only_portal_rem)})",
+        f"🔀 Fuzzy ({len(fuzzy_df)})",
+        f"🧠 Smart ({len(smart_df)})",
+        f"📘 Only Books ({len(only_books_rem)})",
+        f"🌐 Only Portal ({len(only_portal_rem)})",
         f"🚫 No GSTIN ({len(no_gstin)})",
     ])
 
     with tab1:
-        st.caption("These entries are found in both Books and Portal with matching amounts.")
+        st.caption("Exact matches — found in both Books and Portal with matching amounts.")
         if len(matched) > 0: st.dataframe(matched, use_container_width=True, hide_index=True)
-        else: st.success("No exact matches found — try checking fuzzy matched tab!")
+        else: st.success("No exact matches found.")
 
     with tab2:
-        st.caption("Found in both Books and Portal but the amounts do not match — needs investigation.")
+        st.caption("Found in both Books and Portal but amounts do not match — needs investigation.")
         if len(mismatched) > 0: st.dataframe(mismatched, use_container_width=True, hide_index=True)
         else: st.success("No mismatches — everything balances!")
 
     with tab3:
         st.caption(
-            f"Two types of near-matches are shown here:  "
-            f"**Fuzzy Matched** = same GSTIN, invoice numbers are ≥{fuzzy_threshold}% similar.  "
-            f"**Probable Match** = different GSTIN but invoice numbers are similar AND tax amounts are close — "
-            f"likely a GSTIN mismatch / data entry error. Review all rows manually before accepting."
+            f"**Fuzzy Matched** = same GSTIN, invoice strings ≥{fuzzy_threshold}% similar.  "
+            f"**Probable Match** = different GSTIN, similar invoice + amount — likely a GSTIN typo. "
+            f"Review all manually before accepting."
         )
         if len(fuzzy_df) > 0:
-            # Highlight probable matches in a different colour for attention
-            same_gstin = fuzzy_df[~fuzzy_df["Match_Type"].str.contains("Cross", na=False)] if "Match_Type" in fuzzy_df.columns else fuzzy_df
-            cross_gstin = fuzzy_df[fuzzy_df["Match_Type"].str.contains("Cross", na=False)] if "Match_Type" in fuzzy_df.columns else pd.DataFrame()
-
+            same_gstin  = fuzzy_df[~fuzzy_df["Match_Type"].str.contains("Cross", na=False)] if "Match_Type" in fuzzy_df.columns else fuzzy_df
+            cross_gstin = fuzzy_df[fuzzy_df["Match_Type"].str.contains("Cross", na=False)]  if "Match_Type" in fuzzy_df.columns else pd.DataFrame()
             if len(same_gstin) > 0:
                 st.markdown("**🔀 Fuzzy Matched — Same GSTIN, similar invoice number:**")
                 st.dataframe(same_gstin, use_container_width=True, hide_index=True)
             if len(cross_gstin) > 0:
-                st.markdown("**🟡 Probable Match — Different GSTIN, similar invoice + matching amount:**")
-                st.warning("⚠️ These have a GSTIN mismatch — could be a typo in books or portal. Verify before using for ITC claim.")
+                st.markdown("**🟡 Probable Match — Different GSTIN:**")
+                st.warning("⚠️ GSTIN mismatch — verify before using for ITC claim.")
                 st.dataframe(cross_gstin, use_container_width=True, hide_index=True)
         else:
             st.info("No fuzzy matches found. Try lowering the sensitivity slider in the sidebar.")
 
     with tab4:
-        st.caption("These entries are in your Books but NOT found on the GST Portal.")
+        st.caption(
+            "Smart Python matching found these after fuzzy matching.  "
+            "**DeepClean** = matched after stripping year codes & prefixes.  "
+            "**AmountMatch** = unique exact tax amount for this GSTIN.  "
+            "**TokenMatch** = matched on core numeric sequence in the invoice number."
+        )
+        if len(smart_df) > 0:
+            for pass_name, label in [("DeepClean","🧹 Deep Clean — stripped year codes & prefixes"),
+                                      ("AmountMatch","💰 Amount Match — unique tax amount"),
+                                      ("TokenMatch","🔢 Token Match — matched on core invoice number")]:
+                sub = smart_df[smart_df["Match_Type"].str.contains(pass_name, na=False)] if "Match_Type" in smart_df.columns else pd.DataFrame()
+                if len(sub) > 0:
+                    st.markdown(f"**{label} ({len(sub)} records):**")
+                    st.dataframe(sub, use_container_width=True, hide_index=True)
+        else:
+            st.info("No additional smart matches found.")
+
+    with tab5:
+        st.caption("In your Books but NOT found on GST Portal even after all matching passes.")
         if len(only_books_rem) > 0: st.dataframe(only_books_rem, use_container_width=True, hide_index=True)
         else: st.info("No unmatched entries in Books.")
 
-    with tab5:
-        st.caption("These entries are on the GST Portal but NOT found in your Books.")
+    with tab6:
+        st.caption("On GST Portal but NOT found in Books even after all matching passes.")
         if len(only_portal_rem) > 0: st.dataframe(only_portal_rem, use_container_width=True, hide_index=True)
         else: st.info("No unmatched entries in Portal.")
 
-    with tab6:
-        st.caption("Books entries with no GSTIN (e.g. Petty Cash, unregistered vendors).")
+    with tab7:
+        st.caption("Books entries with no GSTIN (Petty Cash, unregistered vendors).")
         if len(no_gstin) > 0: st.dataframe(no_gstin, use_container_width=True, hide_index=True)
         else: st.info("All books entries have a GSTIN.")
+
+    # ──────────────────────────────────────────
+    # AI MATCHING SECTION
+    # ──────────────────────────────────────────
+    st.divider()
+    st.subheader("🤖 Step 4: Claude AI Matching")
+
+    remaining_b_count = len(only_books_rem)
+    remaining_p_count = len(only_portal_rem)
+
+    if remaining_b_count == 0 and remaining_p_count == 0:
+        st.success("✅ Nothing left for AI to review — all items matched by Python!")
+    else:
+        st.info(
+            f"**{remaining_b_count}** books entries and **{remaining_p_count}** portal entries "
+            f"still unmatched. Claude AI will review these and suggest matches with reasoning."
+        )
+        if not ai_api_key:
+            st.warning("🔑 Enter your Anthropic API key in the sidebar to enable AI matching.")
+        elif not ANTHROPIC_AVAILABLE:
+            st.error("⚠️ The `anthropic` package is not installed. Add it to requirements.txt and redeploy.")
+        else:
+            ai_btn = st.button("🤖 Run AI Matching on Remaining Items", type="primary", use_container_width=True)
+            if ai_btn:
+                with st.spinner("Claude AI is analysing remaining unmatched items... (may take 30-60 sec)"):
+                    rem_b = st.session_state.get("only_books_rem",  only_books_rem)
+                    rem_p = st.session_state.get("only_portal_rem", only_portal_rem)
+                    rem_b2, rem_p2, ai_df_result, err = apply_ai_matching(
+                        rem_b, rem_p, ai_api_key, ai_model, ai_batch_size, tolerance
+                    )
+                    st.session_state["ai_df"]           = ai_df_result
+                    st.session_state["only_books_rem"]  = rem_b2
+                    st.session_state["only_portal_rem"] = rem_p2
+                    if err:
+                        st.warning(f"Some GSTINs had errors: {err}")
+
+        # Show AI results if available
+        ai_df = st.session_state.get("ai_df", pd.DataFrame())
+        if len(ai_df) > 0:
+            st.markdown(f"### 🤖 AI Suggested Matches — {len(ai_df)} found")
+            st.caption(
+                "These matches were identified by Claude AI. "
+                "**High confidence** = very likely correct. "
+                "**Medium confidence** = probable, verify manually. "
+                "Review the AI_Reason column to understand why each match was suggested."
+            )
+            high   = ai_df[ai_df["AI_Confidence"] == "High"]   if "AI_Confidence" in ai_df.columns else pd.DataFrame()
+            medium = ai_df[ai_df["AI_Confidence"] == "Medium"] if "AI_Confidence" in ai_df.columns else pd.DataFrame()
+            low    = ai_df[ai_df["AI_Confidence"] == "Low"]    if "AI_Confidence" in ai_df.columns else pd.DataFrame()
+
+            if len(high) > 0:
+                st.markdown(f"**✅ High Confidence ({len(high)}):**")
+                st.dataframe(high, use_container_width=True, hide_index=True)
+            if len(medium) > 0:
+                st.markdown(f"**🟡 Medium Confidence ({len(medium)}) — verify before accepting:**")
+                st.dataframe(medium, use_container_width=True, hide_index=True)
+            if len(low) > 0:
+                st.markdown(f"**🟠 Low Confidence ({len(low)}) — treat as suggestions only:**")
+                st.dataframe(low, use_container_width=True, hide_index=True)
 
     # ──────────────────────────────────────────
     # SUPPLIER DRILL-DOWN
@@ -826,18 +1263,25 @@ if run_btn:
     st.divider()
     st.subheader("📥 Download Colour-Coded Report")
 
-    # Add Status column to fuzzy_df for colour logic
-    fuzzy_export = fuzzy_df.copy() if len(fuzzy_df) > 0 else pd.DataFrame()
+    ai_df_export    = st.session_state.get("ai_df", pd.DataFrame())
+    final_books_rem = st.session_state.get("only_books_rem",  only_books_rem)
+    final_portal_rem= st.session_state.get("only_portal_rem", only_portal_rem)
 
     sheets = {
         "Matched":          matched,
         "Mismatched":       mismatched,
-        "Fuzzy Matched":    fuzzy_export,
-        "Only in Books":    only_books_rem,
-        "Only in Portal":   only_portal_rem,
+        "Fuzzy Matched":    fuzzy_df.copy() if len(fuzzy_df) > 0 else pd.DataFrame(),
+        "Smart Matched":    smart_df.copy() if len(smart_df) > 0 else pd.DataFrame(),
+        "AI Matched":       ai_df_export.copy() if len(ai_df_export) > 0 else pd.DataFrame(),
+        "Only in Books":    final_books_rem,
+        "Only in Portal":   final_portal_rem,
         "No GSTIN":         no_gstin,
         "Full Recon":       full,
     }
+
+    # Update stats with AI results
+    stats["smart"] = len(smart_df)
+    stats["ai"]    = len(ai_df_export)
 
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode_tag   = "GSTIN" if recon_mode == "GSTIN-Level Summary" else "Invoice"
@@ -856,4 +1300,4 @@ if run_btn:
 
 # ── Footer ──
 st.divider()
-st.caption("GST ITC Reconciliation Tool v2 • Fuzzy Matching • Colour-Coded Export • Supplier Drill-Down • Built for CA Professionals")
+st.caption("GST ITC Reconciliation Tool v3 • Exact → Fuzzy → Smart Python → Claude AI Matching • Colour-Coded Export • Supplier Drill-Down • Built for CA Professionals")
