@@ -50,6 +50,7 @@ with st.sidebar:
     st.header("⚙️ Settings")
 
     with st.expander("📘 Books Column Names", expanded=False):
+        b_supplier_id = st.text_input("Supplier ID / Vendor ID", value="Supplier ID", key="b_sid")
         b_gstin    = st.text_input("GSTIN",         value="GSTIN Number",          key="b_gstin")
         b_supplier = st.text_input("Supplier Name", value="Supplier",              key="b_sup")
         b_invoice  = st.text_input("Invoice No",    value="Invoice No",            key="b_inv")
@@ -99,6 +100,11 @@ def similarity(a, b):
 
 def load_books(df):
     out = pd.DataFrame()
+    # Supplier ID — include if column exists, else leave blank
+    if b_supplier_id and b_supplier_id in df.columns:
+        out["Supplier_ID"] = df[b_supplier_id].astype(str).str.strip()
+    else:
+        out["Supplier_ID"] = ""
     out["GSTIN"]         = df[b_gstin].apply(clean_gstin)
     out["Supplier_Name"] = df[b_supplier].astype(str).str.strip()
     out["Invoice_No"]    = df[b_invoice].apply(clean_invoice)
@@ -155,6 +161,7 @@ def _build_fuzzy_row(match_type, gstin_books, gstin_portal, b_row, p_row, inv_sc
 
     return {
         "Match_Type":        match_type.replace("_", " ").title(),
+        "Supplier_ID_Books": b_row.get("Supplier_ID", b_row.get("Supplier_ID_Books", "")),
         "GSTIN_Books":       gstin_books,
         "GSTIN_Portal":      gstin_portal,
         "Supplier_Books":    b_row.get("Supplier_Name", b_row.get("Supplier_Books", "")),
@@ -312,6 +319,7 @@ def apply_fuzzy_matching(only_books_df, only_portal_df, threshold, amt_tol=1.0):
 # ─────────────────────────────────────────────
 def reconcile_gstin_level(books_df, portal_df, tol):
     b_agg = books_df.dropna(subset=["GSTIN"]).groupby("GSTIN", as_index=False).agg(
+        Supplier_ID_Books    =("Supplier_ID",    "first"),
         Supplier_Name_Books  =("Supplier_Name",  "first"),
         Invoice_Count_Books  =("Invoice_No",     "count"),
         Taxable_Books        =("Taxable_Value",  "sum"),
@@ -372,14 +380,15 @@ def reconcile_invoice_level(books_df, portal_df, tol):
     b["_key"] = b["GSTIN"] + "|" + b["Invoice_No"]
     p["_key"] = p["GSTIN"] + "|" + p["Invoice_No"]
 
-    b_r = b.rename(columns={"Supplier_Name":"Supplier_Books","Taxable_Value":"Taxable_Books",
+    b_r = b.rename(columns={"Supplier_ID":"Supplier_ID_Books","Supplier_Name":"Supplier_Books",
+                             "Taxable_Value":"Taxable_Books",
                              "IGST":"IGST_Books","CGST":"CGST_Books","SGST":"SGST_Books",
                              "Cess":"Cess_Books","Total_Tax":"TotalTax_Books","Total_Value":"TotalValue_Books"})
     p_r = p.rename(columns={"Supplier_Name":"Supplier_Portal","Taxable_Value":"Taxable_Portal",
                              "IGST":"IGST_Portal","CGST":"CGST_Portal","SGST":"SGST_Portal",
                              "Cess":"Cess_Portal","Total_Tax":"TotalTax_Portal","Total_Value":"TotalValue_Portal"})
 
-    b_cols = ["_key","GSTIN","Invoice_No","Supplier_Books",
+    b_cols = ["_key","GSTIN","Invoice_No","Supplier_ID_Books","Supplier_Books",
               "Taxable_Books","IGST_Books","CGST_Books","SGST_Books","Cess_Books","TotalTax_Books","TotalValue_Books"]
     p_cols = ["_key","Supplier_Portal","Taxable_Portal","IGST_Portal","CGST_Portal",
               "SGST_Portal","Cess_Portal","TotalTax_Portal","TotalValue_Portal"]
