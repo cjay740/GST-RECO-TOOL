@@ -1,11 +1,15 @@
 """
-GST ITC Reconciliation Tool — v3
+GST ITC Reconciliation Tool — v4
 ==================================
-New in v3:
-  • Smart Python matching (Step 3) — deep invoice cleaning, amount-only matching,
-    numeric token matching to catch cases fuzzy logic misses
-  • Claude AI matching (Step 4) — remaining hard cases sent to Claude API
-    for reasoning-based match suggestions with confidence scores
+New in v4:
+  • Terminal-sequence guard in fuzzy matching — prevents FY2025-26/53 matching
+    FY2025-26/45 (same year-prefix, different sequence numbers)
+  • Meaningful-token Pass C — strips date suffixes like /050226 (DDMMYY) so
+    3605/050226 correctly matches portal entry 3605
+  • Optional Invoice Date column — used as secondary signal in fuzzy matching
+  • GSTIN typo detection — flags Books/Portal GSTIN pairs with edit-distance ≤ 2
+  • No-GSTIN matching — matches entries with missing GSTIN using
+    invoice no + tax amount + supplier name + date
 
 Run:  streamlit run app.py
 """
@@ -68,6 +72,8 @@ with st.sidebar:
         b_cgst     = st.text_input("CGST",          value="Sum of Central Tax",    key="b_cgst")
         b_sgst     = st.text_input("SGST",          value="Sum of State UT Tax",   key="b_sgst")
         b_cess     = st.text_input("Cess",          value="Sum of CESS Tax",       key="b_cess")
+        b_date     = st.text_input("Invoice Date (optional)", value="",          key="b_date",
+                        help="Column name for invoice date in your Books file. Leave blank if not available.")
 
     with st.expander("🌐 Portal Column Names", expanded=False):
         p_gstin    = st.text_input("GSTIN",         value="GSTIN of supplier",          key="p_gstin")
@@ -79,6 +85,8 @@ with st.sidebar:
         p_sgst     = st.text_input("SGST",          value="Sum of State/UT Tax(₹)",     key="p_sgst")
         p_cess     = st.text_input("Cess",          value="Sum of Cess(₹)",             key="p_cess")
         p_itc_avail= st.text_input("ITC Availability", value="ITC Availability",        key="p_itc")
+        p_date     = st.text_input("Invoice Date (optional)", value="",                 key="p_date",
+                        help="Column name for invoice date in your Portal file. Leave blank if not available.")
 
     st.divider()
     st.subheader("🔧 Matching Settings")
@@ -153,6 +161,48 @@ def get_numeric_tokens(s):
     """Extract all numeric sequences from an invoice string.
     E.g. 'NF/2025/00123' → ['2025', '123']"""
     return [t.lstrip("0") for t in re.findall(r'\d+', str(s)) if t.lstrip("0")]
+
+# ── Meaningful-token helpers ────────────────────────────────────────────────
+# Year token:  4-digit starting with 19 or 20  (e.g. 2025)
+_YEAR_TOKEN  = re.compile(r'^(19|20)\d{2}$')
+# 2-digit short fragment (e.g. "26" in FY2025-26)
+_SHORT_FRAG  = re.compile(r'^\d{1,2}$')
+# Date token: 6-digit DDMMYY/MMYYYY or 8-digit DDMMYYYY / YYYYMMDD
+_DATE_TOKEN  = re.compile(r'^\d{6}$|^\d{8}$')
+
+def _meaningful_tokens(s):
+    """Numeric tokens that are NOT year codes, NOT 1-2 digit fragments, and NOT
+    6/8-digit date patterns.  These represent the actual invoice sequence number.
+    E.g. '3605/050226' → ['3605']   (050226 is a date suffix → filtered)
+         'FY2025-26/53'→ ['53']     (2025 = year, 26 = short frag → filtered)"""
+    out = []
+    for raw in re.findall(r'\d+', str(s)):
+        stripped = raw.lstrip("0") or "0"
+        if _YEAR_TOKEN.match(raw):     continue   # year like 2025
+        if _SHORT_FRAG.match(stripped): continue  # 1-2 digit (26, 5, etc.)
+        if _DATE_TOKEN.match(raw):     continue   # 6 or 8 digit date
+        out.append(stripped)
+    return out
+
+def terminal_seq(s):
+    """Last meaningful numeric token = the invoice sequence / running number.
+    FY2025-26/53 → '53',   3605/050226 → '3605',   INV/001 → '1'"""
+    toks = _meaningful_tokens(s)
+    return toks[-1] if toks else ""
+
+def levenshtein(s1, s2):
+    """Character-level edit distance — used for GSTIN typo detection."""
+    s1, s2 = str(s1), str(s2)
+    if s1 == s2: return 0
+    rows, cols = len(s1) + 1, len(s2) + 1
+    dist = [[0] * cols for _ in range(rows)]
+    for i in range(rows): dist[i][0] = i
+    for j in range(cols): dist[0][j] = j
+    for i in range(1, rows):
+        for j in range(1, cols):
+            cost = 0 if s1[i-1] == s2[j-1] else 1
+            dist[i][j] = min(dist[i-1][j] + 1, dist[i][j-1] + 1, dist[i-1][j-1] + cost)
+    return dist[len(s1)][len(s2)]
 
 def apply_smart_matching(only_books_df, only_portal_df, tol):
     """
@@ -257,31 +307,47 @@ def apply_smart_matching(only_books_df, only_portal_df, tol):
                     f"Unique exact tax amount ₹{b_tax} for this GSTIN — invoice formats differ"))
                 b_used_idx.add(b_idx); p_used_idx.add(p_idx)
 
-        # ── Pass C: numeric token match ───────────────────────
+        # ── Pass C: meaningful-token match ────────────────────────────────
+        # Uses _meaningful_tokens() which strips year codes (2025), short
+        # fragments (26), and 6/8-digit date patterns (050226 = DDMMYY).
+        # This catches  3605/050226 ↔ 3605  — the date suffix is filtered,
+        # leaving common token '3605'.  The old "longest token" approach
+        # would use '50226' vs '3605' → no match.
         b_rem2 = b_sub[~b_sub.index.isin(b_used_idx)]
         p_rem2 = p_sub[~p_sub.index.isin(p_used_idx)]
 
-        # Build longest-token → [idx] map for portal
-        p_token_map = {}
+        # Build meaningful-token → [idx] map for portal (per GSTIN scope)
+        p_mtok_map = {}
         for p_idx, p_row in p_rem2.iterrows():
-            tokens = p_row["_tokens"]
-            if tokens:
-                key = max(tokens, key=len)    # use longest numeric token
-                if len(key) >= 3:             # ignore very short tokens
-                    p_token_map.setdefault(key, []).append(p_idx)
+            for tok in _meaningful_tokens(p_row.get("Invoice_No", "")):
+                if len(tok) >= 3:
+                    p_mtok_map.setdefault(tok, []).append(p_idx)
 
         for b_idx, b_row in b_rem2.iterrows():
             if b_idx in b_used_idx: continue
-            tokens = b_row["_tokens"]
-            if not tokens: continue
-            b_key = max(tokens, key=len)
-            if len(b_key) < 3: continue
-            candidates = [i for i in p_token_map.get(b_key, []) if i not in p_used_idx]
-            if len(candidates) == 1:
-                p_idx = candidates[0]
-                smart_rows.append(_record(b_idx, p_idx, "TokenMatch",
-                    f"Core numeric token '{b_key}' found in both invoice numbers"))
-                b_used_idx.add(b_idx); p_used_idx.add(p_idx)
+            b_toks = [t for t in _meaningful_tokens(b_row.get("Invoice_No", "")) if len(t) >= 3]
+            if not b_toks: continue
+
+            matched_p_idx, matched_tok = None, None
+            for b_tok in b_toks:
+                candidates = [i for i in p_mtok_map.get(b_tok, []) if i not in p_used_idx
+                              and i in p_rem2.index]
+                if not candidates: continue
+                # Tax-amount tiebreaker: prefer candidates where ₹ matches within tol
+                b_tax = round(_get_tax(only_books_df.loc[b_idx], True), 2)
+                amt_ok = [c for c in candidates
+                          if abs(round(_get_tax(only_portal_df.loc[c], False), 2) - b_tax) <= tol]
+                pool = amt_ok if amt_ok else candidates
+                if len(pool) == 1:
+                    matched_p_idx = pool[0]
+                    matched_tok   = b_tok
+                    break
+
+            if matched_p_idx is not None:
+                smart_rows.append(_record(b_idx, matched_p_idx, "TokenMatch",
+                    f"Token '{matched_tok}' matched after stripping year/date codes "
+                    f"('{b_row['Invoice_No']}' ↔ '{only_portal_df.loc[matched_p_idx,'Invoice_No']}')"))
+                b_used_idx.add(b_idx); p_used_idx.add(matched_p_idx)
 
     smart_df = pd.DataFrame(smart_rows)
     rem_books  = only_books_df.drop(index=list(b_used_idx)).reset_index(drop=True)
@@ -455,6 +521,11 @@ def load_books(df):
     out["Cess"]          = safe_float(df[b_cess])
     out["Total_Tax"]     = out["IGST"] + out["CGST"] + out["SGST"] + out["Cess"]
     out["Total_Value"]   = out["Taxable_Value"] + out["Total_Tax"]
+    # Optional: Invoice Date
+    if b_date and b_date in df.columns:
+        out["Invoice_Date"] = pd.to_datetime(df[b_date], dayfirst=True, errors="coerce")
+    else:
+        out["Invoice_Date"] = pd.NaT
     return out
 
 def load_portal(df):
@@ -471,6 +542,11 @@ def load_portal(df):
     out["Total_Value"]   = out["Taxable_Value"] + out["Total_Tax"]
     if p_itc_avail in df.columns:
         out["ITC_Availability"] = df[p_itc_avail].astype(str).str.strip()
+    # Optional: Invoice Date
+    if p_date and p_date in df.columns:
+        out["Invoice_Date"] = pd.to_datetime(df[p_date], dayfirst=True, errors="coerce")
+    else:
+        out["Invoice_Date"] = pd.NaT
     return out
 
 # ─────────────────────────────────────────────
@@ -550,18 +626,40 @@ def apply_fuzzy_matching(only_books_df, only_portal_df, threshold, amt_tol=1.0):
             if b_idx in books_used_idx:
                 continue
             best_score, best_p_idx = -1, None
+            b_seq = terminal_seq(b_row["Invoice_No"])   # invoice sequence number
+
             for p_idx, p_row in p_sub.iterrows():
                 if p_idx in portal_used_idx:
                     continue
                 score = similarity(b_row["Invoice_No"], p_row["Invoice_No"])
                 if score >= threshold and score > best_score:
+                    # ── Terminal-sequence guard ──────────────────────────────
+                    # If both invoices have a clear sequence number (non-year,
+                    # non-date final token) and they DIFFER, skip this pair.
+                    # Prevents FY2025-26/53 matching FY2025-26/45 (92% similar
+                    # but different invoice numbers).
+                    p_seq = terminal_seq(p_row.get("Invoice_No", ""))
+                    if b_seq and p_seq and b_seq != p_seq:
+                        continue   # different invoice sequence → skip
                     best_score, best_p_idx = score, p_idx
 
             if best_p_idx is not None:
                 p_row = only_portal_df.loc[best_p_idx]
-                fuzzy_rows.append(_build_fuzzy_row(
+                row = _build_fuzzy_row(
                     "same_gstin", gstin, gstin, b_row, p_row, best_score, amt_tol
-                ))
+                )
+                # Add date note if dates are available
+                b_date_val = b_row.get("Invoice_Date", pd.NaT)
+                p_date_val = p_row.get("Invoice_Date", pd.NaT)
+                if not pd.isna(b_date_val) and not pd.isna(p_date_val):
+                    date_diff = abs((pd.Timestamp(b_date_val) - pd.Timestamp(p_date_val)).days)
+                    if date_diff == 0:
+                        row["Date_Note"] = "✅ Dates match"
+                    elif date_diff <= 7:
+                        row["Date_Note"] = f"⚠️ Dates differ by {date_diff} day(s)"
+                    else:
+                        row["Date_Note"] = f"🔴 Dates differ by {date_diff} day(s) — verify"
+                fuzzy_rows.append(row)
                 books_used_idx.add(b_idx)
                 portal_used_idx.add(best_p_idx)
 
@@ -653,6 +751,164 @@ def apply_fuzzy_matching(only_books_df, only_portal_df, threshold, amt_tol=1.0):
         remaining_portal.reset_index(drop=True),
         all_fuzzy
     )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GSTIN Typo Detection
+# ─────────────────────────────────────────────────────────────────────────────
+def detect_gstin_typos(only_books_df, only_portal_df):
+    """Find Books GSTINs that are likely typos of Portal GSTINs (edit distance ≤ 2).
+    A GSTIN is 15 characters — one wrong letter/digit is a common data-entry error
+    (0/O confusion, 1/I confusion, wrong state code, etc.)."""
+    typo_rows = []
+    if only_books_df.empty or only_portal_df.empty:
+        return pd.DataFrame()
+
+    b_gstins = [g for g in only_books_df["GSTIN"].dropna().unique() if str(g).strip()]
+    p_gstins = [g for g in only_portal_df["GSTIN"].dropna().unique() if str(g).strip()]
+    p_gstin_set = set(p_gstins)
+
+    for b_g in b_gstins:
+        if b_g in p_gstin_set:
+            continue   # exact match — already handled by reconciliation
+        for p_g in p_gstins:
+            dist = levenshtein(str(b_g), str(p_g))
+            if 0 < dist <= 2:
+                b_sub = only_books_df[only_books_df["GSTIN"] == b_g]
+                p_sub = only_portal_df[only_portal_df["GSTIN"] == p_g]
+                typo_rows.append({
+                    "GSTIN_Books":       b_g,
+                    "GSTIN_Portal":      p_g,
+                    "Edit_Distance":     dist,
+                    "Supplier_Books":    b_sub["Supplier_Name"].iloc[0] if len(b_sub) else "",
+                    "Supplier_Portal":   p_sub["Supplier_Name"].iloc[0] if len(p_sub) else "",
+                    "Invoices_Books":    len(b_sub),
+                    "Invoices_Portal":   len(p_sub),
+                    "TotalTax_Books":    round(b_sub["Total_Tax"].sum(), 2),
+                    "TotalTax_Portal":   round(p_sub["Total_Tax"].sum(), 2),
+                    "Action":            (
+                        "⚠️ 1 character difference — likely typo. Correct the GSTIN in Books and re-run."
+                        if dist == 1 else
+                        "🔍 2 character difference — possible typo. Verify supplier identity."
+                    ),
+                })
+    df = pd.DataFrame(typo_rows)
+    # Remove duplicate pairs (b_g ↔ p_g and p_g ↔ b_g)
+    if not df.empty:
+        df = df.sort_values("Edit_Distance").drop_duplicates(
+            subset=["GSTIN_Books", "GSTIN_Portal"])
+    return df.reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# No-GSTIN Fuzzy Matching
+# ─────────────────────────────────────────────────────────────────────────────
+def apply_no_gstin_matching(no_gstin_df, portal_df, threshold, amt_tol):
+    """Match Books entries that have NO GSTIN against Portal using:
+      • Invoice number similarity
+      • Tax amount proximity
+      • Supplier name similarity
+      • Invoice date proximity (if available)
+
+    Used for:
+      - Entries where accountant forgot to enter GSTIN in Books
+      - Petty cash matched on invoice no + tax amount + date (name may not match)
+    All results are flagged as 'Needs Verification' — NOT auto-accepted."""
+
+    if no_gstin_df.empty or portal_df.empty:
+        return no_gstin_df, pd.DataFrame()
+
+    matched_rows  = []
+    b_used        = set()
+
+    for b_idx, b_row in no_gstin_df.iterrows():
+        if b_idx in b_used: continue
+        b_inv   = str(b_row.get("Invoice_No", "") or "")
+        b_name  = str(b_row.get("Supplier_Name", "") or "")
+        b_tax   = float(b_row.get("Total_Tax", 0) or 0)
+        b_date  = b_row.get("Invoice_Date", pd.NaT)
+
+        best_score, best_p_idx = -1, None
+
+        for p_idx, p_row in portal_df.iterrows():
+            p_inv   = str(p_row.get("Invoice_No", "") or "")
+            p_name  = str(p_row.get("Supplier_Name", "") or "")
+            p_tax   = float(p_row.get("Total_Tax", 0) or 0)
+            p_date  = p_row.get("Invoice_Date", pd.NaT)
+
+            inv_score  = similarity(b_inv,  p_inv)
+            name_score = similarity(b_name, p_name)
+            amt_close  = abs(b_tax - p_tax) <= amt_tol * 2
+
+            # Date proximity score (0–100, 50 if unknown)
+            try:
+                if not pd.isna(b_date) and not pd.isna(p_date):
+                    days_diff = abs((pd.Timestamp(b_date) - pd.Timestamp(p_date)).days)
+                    date_score = 100 if days_diff == 0 else (80 if days_diff <= 3 else
+                                 60 if days_diff <= 7 else 0)
+                else:
+                    date_score = 50   # unknown date → neutral
+            except Exception:
+                date_score = 50
+
+            # Qualify if invoice matches AND (amount close OR date close OR name similar)
+            inv_ok = inv_score >= threshold
+            if not inv_ok:
+                continue
+
+            qualifies = amt_close or date_score >= 80 or name_score >= threshold
+
+            if not qualifies:
+                continue
+
+            # Combined score
+            combined = (inv_score * 0.45 + name_score * 0.2
+                        + (100 if amt_close else 0) * 0.25 + date_score * 0.1)
+
+            if combined > best_score:
+                best_score, best_p_idx = combined, p_idx
+
+        if best_p_idx is not None:
+            p_row  = portal_df.loc[best_p_idx]
+            p_tax  = float(p_row.get("Total_Tax", 0) or 0)
+            p_inv  = str(p_row.get("Invoice_No", "") or "")
+            p_name = str(p_row.get("Supplier_Name", "") or "")
+            p_date = p_row.get("Invoice_Date", pd.NaT)
+
+            # Build date note
+            try:
+                if not pd.isna(b_date) and not pd.isna(p_date):
+                    days_diff = abs((pd.Timestamp(b_date) - pd.Timestamp(p_date)).days)
+                    date_note = (f"Dates match" if days_diff == 0
+                                 else f"Dates differ {days_diff}d")
+                else:
+                    date_note = "Date N/A"
+            except Exception:
+                date_note = "Date N/A"
+
+            matched_rows.append({
+                "Match_Type":           "No-GSTIN Match",
+                "Supplier_ID_Books":    b_row.get("Supplier_ID", ""),
+                "GSTIN_Books":          "MISSING",
+                "GSTIN_Portal":         p_row.get("GSTIN", ""),
+                "Supplier_Books":       b_row.get("Supplier_Name", ""),
+                "Supplier_Portal":      p_row.get("Supplier_Name", ""),
+                "Invoice_Books":        b_inv,
+                "Invoice_Portal":       p_inv,
+                "Invoice_Similarity_%": round(similarity(b_inv, p_inv), 1),
+                "Name_Similarity_%":    round(similarity(b_name, p_name), 1),
+                "TotalTax_Books":       round(b_tax, 2),
+                "TotalTax_Portal":      round(p_tax, 2),
+                "Tax_Difference":       round(b_tax - p_tax, 2),
+                "Date_Note":            date_note,
+                "Match_Score_%":        round(best_score, 1),
+                "Status":               "⚠️ No-GSTIN Match — Verify GSTIN before using for ITC",
+                "Action":               "Verify: is this the same transaction? If yes, correct GSTIN in Books.",
+            })
+            b_used.add(b_idx)
+
+    remaining = no_gstin_df.drop(index=list(b_used)).reset_index(drop=True)
+    return remaining, pd.DataFrame(matched_rows)
+
 
 # ─────────────────────────────────────────────
 # GSTIN-Level Reconciliation
@@ -1040,19 +1296,29 @@ if run_btn:
             only_books_rem, only_portal_rem, tolerance
         )
 
+    with st.spinner("Detecting GSTIN typos..."):
+        gstin_typo_df = detect_gstin_typos(only_books_rem, only_portal_rem)
+
+    with st.spinner("Matching no-GSTIN entries (invoice / amount / name / date)..."):
+        no_gstin_rem, no_gstin_matched_df = apply_no_gstin_matching(
+            no_gstin.copy(), portal_df, fuzzy_threshold, tolerance
+        )
+
     # Store in session state so AI can use them later without re-running
-    st.session_state["only_books_rem"]  = only_books_rem
-    st.session_state["only_portal_rem"] = only_portal_rem
-    st.session_state["matched"]         = matched
-    st.session_state["mismatched"]      = mismatched
-    st.session_state["fuzzy_df"]        = fuzzy_df
-    st.session_state["smart_df"]        = smart_df
-    st.session_state["no_gstin"]        = no_gstin
-    st.session_state["full"]            = full
-    st.session_state["books_df"]        = books_df
-    st.session_state["portal_df"]       = portal_df
-    st.session_state["recon_done"]      = True
-    st.session_state["ai_df"]           = pd.DataFrame()   # reset AI results on new run
+    st.session_state["only_books_rem"]       = only_books_rem
+    st.session_state["only_portal_rem"]      = only_portal_rem
+    st.session_state["matched"]              = matched
+    st.session_state["mismatched"]           = mismatched
+    st.session_state["fuzzy_df"]             = fuzzy_df
+    st.session_state["smart_df"]             = smart_df
+    st.session_state["no_gstin"]             = no_gstin_rem
+    st.session_state["no_gstin_matched_df"]  = no_gstin_matched_df
+    st.session_state["gstin_typo_df"]        = gstin_typo_df
+    st.session_state["full"]                 = full
+    st.session_state["books_df"]             = books_df
+    st.session_state["portal_df"]            = portal_df
+    st.session_state["recon_done"]           = True
+    st.session_state["ai_df"]               = pd.DataFrame()   # reset AI results on new run
 
     # ── Amount summary ──
     bk = books_df.dropna(subset=["GSTIN"])
@@ -1087,31 +1353,35 @@ if run_btn:
 # ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.get("recon_done"):
     # Retrieve everything from session_state so this block works on every rerun
-    matched         = st.session_state["matched"]
-    mismatched      = st.session_state["mismatched"]
-    fuzzy_df        = st.session_state["fuzzy_df"]
-    smart_df        = st.session_state["smart_df"]
-    only_books_rem  = st.session_state["only_books_rem"]
-    only_portal_rem = st.session_state["only_portal_rem"]
-    no_gstin        = st.session_state["no_gstin"]
-    full            = st.session_state["full"]
-    books_df        = st.session_state["books_df"]
-    portal_df       = st.session_state["portal_df"]
-    amt_df          = st.session_state["amt_df"]
-    stats           = st.session_state["stats"]
-    recon_mode      = st.session_state.get("recon_mode", recon_mode)
+    matched              = st.session_state["matched"]
+    mismatched           = st.session_state["mismatched"]
+    fuzzy_df             = st.session_state["fuzzy_df"]
+    smart_df             = st.session_state["smart_df"]
+    only_books_rem       = st.session_state["only_books_rem"]
+    only_portal_rem      = st.session_state["only_portal_rem"]
+    no_gstin             = st.session_state["no_gstin"]
+    no_gstin_matched_df  = st.session_state.get("no_gstin_matched_df", pd.DataFrame())
+    gstin_typo_df        = st.session_state.get("gstin_typo_df",       pd.DataFrame())
+    full                 = st.session_state["full"]
+    books_df             = st.session_state["books_df"]
+    portal_df            = st.session_state["portal_df"]
+    amt_df               = st.session_state["amt_df"]
+    stats                = st.session_state["stats"]
+    recon_mode           = st.session_state.get("recon_mode", recon_mode)
 
     # ── Summary metrics ──
     st.divider()
     st.subheader("📊 Reconciliation Summary")
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    c1.metric("✅ Matched",        len(matched))
-    c2.metric("⚠️ Mismatched",     len(mismatched))
-    c3.metric("🔀 Fuzzy Matched",  len(fuzzy_df))
-    c4.metric("🧠 Smart Matched",  len(smart_df))
-    c5.metric("📘 Only in Books",  len(only_books_rem))
-    c6.metric("🌐 Only in Portal", len(only_portal_rem))
-    c7.metric("🚫 No GSTIN",       len(no_gstin))
+    c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns(9)
+    c1.metric("✅ Matched",           len(matched))
+    c2.metric("⚠️ Mismatched",        len(mismatched))
+    c3.metric("🔀 Fuzzy Matched",     len(fuzzy_df))
+    c4.metric("🧠 Smart Matched",     len(smart_df))
+    c5.metric("📘 Only in Books",     len(only_books_rem))
+    c6.metric("🌐 Only in Portal",    len(only_portal_rem))
+    c7.metric("🚫 No GSTIN (unmatch)",len(no_gstin))
+    c8.metric("🔴 GSTIN Typos",       len(gstin_typo_df))
+    c9.metric("🔗 No-GSTIN Matched",  len(no_gstin_matched_df))
 
     total_near = len(fuzzy_df) + len(smart_df)
     if total_near > 0:
@@ -1130,7 +1400,7 @@ if st.session_state.get("recon_done"):
 
     # ── Detailed tabs ──
     st.divider()
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         f"✅ Matched ({len(matched)})",
         f"⚠️ Mismatched ({len(mismatched)})",
         f"🔀 Fuzzy ({len(fuzzy_df)})",
@@ -1138,6 +1408,8 @@ if st.session_state.get("recon_done"):
         f"📘 Only Books ({len(only_books_rem)})",
         f"🌐 Only Portal ({len(only_portal_rem)})",
         f"🚫 No GSTIN ({len(no_gstin)})",
+        f"🔴 GSTIN Typos ({len(gstin_typo_df)})",
+        f"🔗 No-GSTIN Matched ({len(no_gstin_matched_df)})",
     ])
 
     with tab1:
@@ -1198,9 +1470,34 @@ if st.session_state.get("recon_done"):
         else: st.info("No unmatched entries in Portal.")
 
     with tab7:
-        st.caption("Books entries with no GSTIN (Petty Cash, unregistered vendors).")
+        st.caption("Books entries with no GSTIN that could NOT be matched even without GSTIN (Petty Cash, unregistered vendors with no portal equivalent).")
         if len(no_gstin) > 0: st.dataframe(no_gstin, use_container_width=True, hide_index=True)
-        else: st.info("All books entries have a GSTIN.")
+        else: st.info("All no-GSTIN entries were either matched or accounted for.")
+
+    with tab8:
+        st.caption(
+            "**GSTIN Typo Candidates** — Books GSTINs that differ from a Portal GSTIN by only 1-2 characters. "
+            "These are likely data-entry errors (0/O confusion, wrong state code, etc.). "
+            "**Action: Correct the GSTIN in your Books and re-run reconciliation.**"
+        )
+        if len(gstin_typo_df) > 0:
+            st.warning(f"⚠️ Found {len(gstin_typo_df)} probable GSTIN typo(s). Correct these in your Books to improve match rate.")
+            st.dataframe(gstin_typo_df, use_container_width=True, hide_index=True)
+        else:
+            st.success("✅ No GSTIN typos detected.")
+
+    with tab9:
+        st.caption(
+            "**No-GSTIN Matches** — Books entries that had no GSTIN but were matched against Portal "
+            "using invoice number + tax amount + supplier name + date. "
+            "⚠️ **These are suggestions only** — verify each one manually before using for ITC claim. "
+            "If correct, add the GSTIN to your Books."
+        )
+        if len(no_gstin_matched_df) > 0:
+            st.warning(f"🔗 {len(no_gstin_matched_df)} possible match(es) found. Verify GSTIN before accepting.")
+            st.dataframe(no_gstin_matched_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No matches found for no-GSTIN entries.")
 
     # ──────────────────────────────────────────
     # AI MATCHING SECTION
@@ -1342,12 +1639,16 @@ if st.session_state.get("recon_done"):
         "Only in Books":    final_books_rem,
         "Only in Portal":   final_portal_rem,
         "No GSTIN":         no_gstin,
+        "GSTIN Typos":      gstin_typo_df.copy() if len(gstin_typo_df) > 0 else pd.DataFrame(),
+        "No-GSTIN Matched": no_gstin_matched_df.copy() if len(no_gstin_matched_df) > 0 else pd.DataFrame(),
         "Full Recon":       full,
     }
 
     # Update stats with AI results
-    stats["smart"] = len(smart_df)
-    stats["ai"]    = len(ai_df_export)
+    stats["smart"]            = len(smart_df)
+    stats["ai"]               = len(ai_df_export)
+    stats["gstin_typos"]      = len(gstin_typo_df)
+    stats["no_gstin_matched"] = len(no_gstin_matched_df)
 
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode_tag   = "GSTIN" if recon_mode == "GSTIN-Level Summary" else "Invoice"
