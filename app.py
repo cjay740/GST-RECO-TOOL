@@ -1077,6 +1077,30 @@ if run_btn:
         "no_gstin":   len(no_gstin),
     }
 
+    st.session_state["amt_df"]     = amt_df
+    st.session_state["stats"]      = stats
+    st.session_state["recon_mode"] = recon_mode
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Results display — lives OUTSIDE if run_btn: so that clicking "Run AI Matching"
+# (or any other button) does NOT wipe the results from the screen.
+# ─────────────────────────────────────────────────────────────────────────────
+if st.session_state.get("recon_done"):
+    # Retrieve everything from session_state so this block works on every rerun
+    matched         = st.session_state["matched"]
+    mismatched      = st.session_state["mismatched"]
+    fuzzy_df        = st.session_state["fuzzy_df"]
+    smart_df        = st.session_state["smart_df"]
+    only_books_rem  = st.session_state["only_books_rem"]
+    only_portal_rem = st.session_state["only_portal_rem"]
+    no_gstin        = st.session_state["no_gstin"]
+    full            = st.session_state["full"]
+    books_df        = st.session_state["books_df"]
+    portal_df       = st.session_state["portal_df"]
+    amt_df          = st.session_state["amt_df"]
+    stats           = st.session_state["stats"]
+    recon_mode      = st.session_state.get("recon_mode", recon_mode)
+
     # ── Summary metrics ──
     st.divider()
     st.subheader("📊 Reconciliation Summary")
